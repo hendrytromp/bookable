@@ -467,18 +467,18 @@ function extractStatementAmountsFromLine(line, columnIndexes) {
     };
   }
 
-  const balanceMatch = amountMatches.findLast((match) => match.index >= columnIndexes.balanceStart) || amountMatches[amountMatches.length - 1];
-  const transactionMatches = amountMatches.filter((match) => match !== balanceMatch);
+  const balanceMatch = amountMatches[amountMatches.length - 1];
+  const transactionMatches = amountMatches.slice(0, -1);
   let debitAmount = null;
   let creditAmount = null;
 
   transactionMatches.forEach((match) => {
-    if (match.index >= columnIndexes.creditsStart && match.index < columnIndexes.balanceStart) {
+    if (match.index >= columnIndexes.creditsStart) {
       creditAmount = match.value;
       return;
     }
 
-    if (match.index >= columnIndexes.debitsStart && match.index < columnIndexes.creditsStart) {
+    if (match.index >= columnIndexes.debitsStart) {
       debitAmount = match.value;
     }
   });
@@ -486,7 +486,7 @@ function extractStatementAmountsFromLine(line, columnIndexes) {
   if (transactionMatches.length === 1 && debitAmount == null && creditAmount == null) {
     if (transactionMatches[0].index >= columnIndexes.creditsStart) {
       creditAmount = transactionMatches[0].value;
-    } else if (transactionMatches[0].index >= columnIndexes.debitsStart) {
+    } else {
       debitAmount = transactionMatches[0].value;
     }
   }
@@ -494,16 +494,8 @@ function extractStatementAmountsFromLine(line, columnIndexes) {
   return {
     debitAmount,
     creditAmount,
-    balanceAmount: balanceMatch?.value ?? null,
+    balanceAmount: balanceMatch.value,
   };
-}
-
-function extractDescriptionSegment(line, columnIndexes) {
-  return normalizeWhitespace(line.slice(columnIndexes.descriptionStart, columnIndexes.debitsStart));
-}
-
-function isStatementTransactionStart(line) {
-  return /^\s*\d{2}\/\d{2}\/\d{2}\b/.test(line);
 }
 
 function inferDebitFromBalance(previousBalance, balanceAmount, amount, description) {
@@ -517,50 +509,6 @@ function inferDebitFromBalance(previousBalance, balanceAmount, amount, descripti
   return /(ATM|POS|PURCHASE|WITHDRAWAL|PAYMENT|FEE|TRANSFER TO|DEBIT)/i.test(description);
 }
 
-function parseTransactionLine(line, columnIndexes, previousBalance) {
-  const match = line.match(/^\s*(\d{2}\/\d{2}\/\d{2})(?:\s+(\d{2}\/\d{2}\/\d{2}|99\/99\/99))?/);
-  if (!match) {
-    return null;
-  }
-
-  const [, transactionDateRaw, valueDateRaw] = match;
-  const { debitAmount, creditAmount, balanceAmount } = extractStatementAmountsFromLine(line, columnIndexes);
-  const description = extractDescriptionSegment(line, columnIndexes);
-  const transactionAmount = debitAmount ?? creditAmount;
-
-  if (transactionAmount == null && balanceAmount == null) {
-    return {
-      transactionDate: normalizeStatementDate(transactionDateRaw),
-      valueDate: normalizeStatementDate(valueDateRaw || transactionDateRaw),
-      description,
-      pendingContinuation: true,
-      statementRowText: line.trim(),
-    };
-  }
-
-  let isDebit;
-  if (debitAmount != null && creditAmount == null) {
-    isDebit = true;
-  } else if (creditAmount != null && debitAmount == null) {
-    isDebit = false;
-  } else {
-    isDebit = inferDebitFromBalance(previousBalance, balanceAmount, transactionAmount, description);
-  }
-
-  return {
-    transactionDate: normalizeStatementDate(transactionDateRaw),
-    valueDate: normalizeStatementDate(valueDateRaw || transactionDateRaw),
-    description,
-    amountCurrency: {
-      amount: transactionAmount,
-      currencyCode: "AWG",
-    },
-    isDebit,
-    runningBalance: balanceAmount,
-    statementRowText: line,
-  };
-}
-
 function parsePdfStatementTransactions(text) {
   const lines = String(text || "").replace(/\r/g, "").split("\n");
   const items = [];
@@ -569,103 +517,172 @@ function parsePdfStatementTransactions(text) {
     endingBalance: null,
   };
   let currentTransaction = null;
-  let previousBalance = null;
   let columnIndexes = null;
 
   const finalizeCurrentTransaction = () => {
-    if (!currentTransaction || typeof currentTransaction?.amountCurrency?.amount !== "number") {
+    if (!currentTransaction) {
       currentTransaction = null;
       return;
     }
 
-    items.push(currentTransaction);
-    if (typeof currentTransaction.runningBalance === "number") {
-      previousBalance = currentTransaction.runningBalance;
-      metadata.endingBalance = {
-        amount: currentTransaction.runningBalance,
-        currencyCode: "AWG",
-      };
+    const rawDescription = normalizeWhitespace(currentTransaction.descriptionLines.join(" "));
+    if (!rawDescription) {
+      currentTransaction = null;
+      return;
     }
+
+    if (/Balance Forward/i.test(rawDescription)) {
+      if (currentTransaction.balanceAmount != null && !metadata.balanceForward) {
+        metadata.balanceForward = {
+          amount: currentTransaction.balanceAmount,
+          currencyCode: "AWG",
+          transactionDate: normalizeStatementDate(currentTransaction.transactionDate),
+        };
+      }
+      currentTransaction = null;
+      return;
+    }
+
+    if (/^Ending Balance/i.test(rawDescription)) {
+      if (currentTransaction.balanceAmount != null) {
+        metadata.endingBalance = {
+          amount: currentTransaction.balanceAmount,
+          currencyCode: "AWG",
+          transactionDate: normalizeStatementDate(currentTransaction.transactionDate),
+        };
+      }
+      currentTransaction = null;
+      return;
+    }
+
+    const amount = currentTransaction.debitAmount ?? currentTransaction.creditAmount ?? null;
+    items.push({
+      transactionDate: normalizeStatementDate(currentTransaction.transactionDate),
+      valueDate: normalizeStatementDate(currentTransaction.valueDate),
+      description: rawDescription,
+      statementRowText: currentTransaction.statementRowText || "",
+      amountCurrency: {
+        amount,
+        currencyCode: "AWG",
+      },
+      balanceCurrency: currentTransaction.balanceAmount == null
+        ? null
+        : {
+            amount: currentTransaction.balanceAmount,
+            currencyCode: "AWG",
+          },
+      isDebit: currentTransaction.debitAmount != null,
+      referenceNumber: currentTransaction.referenceNumber || "",
+      transactionCode: currentTransaction.transactionCode || null,
+    });
     currentTransaction = null;
   };
 
-  lines.forEach((line) => {
-    if (!columnIndexes) {
-      columnIndexes = detectStatementColumns(line) || columnIndexes;
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\u00a0/g, " ");
+
+    if (line.includes("Date") && line.includes("Value Date") && line.includes("Description") && line.includes("Debits") && line.includes("Credits") && line.includes("Balance")) {
+      finalizeCurrentTransaction();
+      columnIndexes = detectStatementColumns(line);
+      continue;
     }
 
     const trimmedLine = line.trim();
     if (shouldIgnoreStatementLine(trimmedLine)) {
-      return;
-    }
-
-    const balanceForwardMatch = trimmedLine.match(/(Balance Forward|Opening Balance|Balance Brought Forward).*?(\d[\d,]*\.\d{2}|\.\d{2})$/i);
-    if (balanceForwardMatch) {
-      const amount = parseStatementAmount(balanceForwardMatch[2]);
-      if (typeof amount === "number") {
-        metadata.balanceForward = {
-          amount,
-          currencyCode: "AWG",
-        };
-        previousBalance = amount;
-      }
-      return;
-    }
-
-    const endingBalanceMatch = trimmedLine.match(/(Ending Balance|Closing Balance|New Balance).*?(\d[\d,]*\.\d{2}|\.\d{2})$/i);
-    if (endingBalanceMatch) {
-      const amount = parseStatementAmount(endingBalanceMatch[2]);
-      if (typeof amount === "number") {
-        metadata.endingBalance = {
-          amount,
-          currencyCode: "AWG",
-        };
-      }
-      return;
+      continue;
     }
 
     if (!columnIndexes) {
-      return;
+      continue;
     }
 
-    const nextTransaction = parseTransactionLine(line, columnIndexes, previousBalance);
-    if (nextTransaction) {
+    const rowMatch = line.match(/^\s*(\d{2}\/\d{2}\/\d{2})\s+(\d{2}\/\d{2}\/\d{2}|99\/99\/99)?\s+/);
+    if (rowMatch) {
       finalizeCurrentTransaction();
-      currentTransaction = nextTransaction;
-      return;
+
+      const transactionDate = line.slice(0, columnIndexes.valueDateStart).trim();
+      const valueDate = line.slice(columnIndexes.valueDateStart, columnIndexes.descriptionStart).trim();
+      const description = line.slice(columnIndexes.descriptionStart, columnIndexes.debitsStart).trim();
+      const { debitAmount, creditAmount, balanceAmount } = extractStatementAmountsFromLine(line, columnIndexes);
+
+      currentTransaction = {
+        transactionDate,
+        valueDate,
+        debitAmount,
+        creditAmount,
+        balanceAmount,
+        statementRowText: line.trim(),
+        referenceNumber: "",
+        transactionCode: null,
+        descriptionLines: description ? [description] : [],
+      };
+      continue;
     }
 
     if (currentTransaction) {
-      const continuationText = isStatementTransactionStart(line)
-        ? ""
-        : normalizeWhitespace(line.slice(columnIndexes.descriptionStart, columnIndexes.balanceStart));
-
-      if (continuationText) {
-        currentTransaction.description = normalizeWhitespace(`${currentTransaction.description} ${continuationText}`);
-        currentTransaction.statementRowText = `${currentTransaction.statementRowText} ${continuationText}`;
+      if (trimmedLine) {
+        currentTransaction.descriptionLines.push(trimmedLine);
       }
     }
-  });
+  }
 
   finalizeCurrentTransaction();
 
   return {
     items,
-    balanceForward: metadata.balanceForward,
-    endingBalance: metadata.endingBalance,
+    metadata,
   };
+}
+
+function reconcilePdfStatementItems(items, openingBalance = null) {
+  let previousBalance = typeof openingBalance === "number" ? openingBalance : null;
+
+  return items.map((item) => {
+    const amount = item?.amountCurrency?.amount;
+    const currentBalance = item?.balanceCurrency?.amount;
+
+    if (typeof amount !== "number" || typeof currentBalance !== "number" || previousBalance == null) {
+      if (typeof currentBalance === "number") {
+        previousBalance = currentBalance;
+      }
+
+      return item;
+    }
+
+    const delta = +(currentBalance - previousBalance).toFixed(2);
+    const debitDelta = +(-amount).toFixed(2);
+    const creditDelta = +amount.toFixed(2);
+    const debitDistance = Math.abs(delta - debitDelta);
+    const creditDistance = Math.abs(delta - creditDelta);
+
+    const reconciledIsDebit = debitDistance < creditDistance;
+    previousBalance = currentBalance;
+
+    return {
+      ...item,
+      isDebit: reconciledIsDebit,
+    };
+  });
 }
 
 export async function extractPdfStatementPayload(buffer, options = {}) {
   const result = await pdfParse(buffer);
-  const payload = parsePdfStatementTransactions(result.text);
+  const { removeAuthNoise = true } = options;
+  const { items, metadata } = parsePdfStatementTransactions(result.text);
+  const reconciledItems = reconcilePdfStatementItems(items, metadata.balanceForward?.amount ?? null);
 
   return buildFilteredSearchPayload(
     {
-      ...payload,
-      pageCount: result.numpages,
-      pdfInfo: result.info || {},
+      items: reconciledItems,
+      totalCount: reconciledItems.length,
+      totalResults: reconciledItems.length,
+      hasMoreResults: false,
+      access: true,
+      source: "pdf-statement",
+      preview: result.text.slice(0, 1500),
+      balanceForward: metadata.balanceForward,
+      endingBalance: metadata.endingBalance,
     },
-    options
+    { removeAuthNoise }
   );
 }
