@@ -44,6 +44,25 @@ function formatNumericCurrency(amount, currencyCode = "AWG") {
   }).format(amount);
 }
 
+function formatSignedAmount(item, currencyCode = "AWG") {
+  const rawAmount = typeof item?.amountCurrency?.amount === "number"
+    ? item.amountCurrency.amount
+    : typeof item?.amount === "number"
+      ? item.amount
+      : null;
+
+  if (rawAmount == null) {
+    return "-";
+  }
+
+  const formattedAmount = formatNumericCurrency(rawAmount, currencyCode);
+  if (!formattedAmount) {
+    return "-";
+  }
+
+  return `${item?.isDebit === true ? "-" : "+"} ${formattedAmount}`;
+}
+
 function StatCard({ label, value, subtitle }) {
   return (
     <Paper
@@ -417,7 +436,7 @@ export default function StatementCleaningApp() {
                           variant={item?.bookable === false ? "outlined" : "filled"}
                         />
                       </TableCell>
-                      <TableCell align="right">{item.amountCurrency?.amount ?? item.amount ?? "-"}</TableCell>
+                      <TableCell align="right">{formatSignedAmount(item, item?.amountCurrency?.currencyCode || balanceCurrency)}</TableCell>
                     </TableRow>
                   ))
                 ) : (
