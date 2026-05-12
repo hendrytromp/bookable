@@ -55,10 +55,10 @@ function formatSignedAmount(item, currencyCode = "AWG") {
     return "-";
   }
 
-  const formattedAmount = formatNumericCurrency(rawAmount, currencyCode);
-  if (!formattedAmount) {
-    return "-";
-  }
+  const formattedAmount = new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(rawAmount);
 
   return `${item?.isDebit === true ? "-" : "+"} ${formattedAmount}`;
 }
